@@ -1,0 +1,100 @@
+name: Build and Deploy
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+env:
+  REGISTRY: cr.yandex
+  REGISTRY_ID: crpvgs42tbh16im42p7a
+  IMAGE_NAME: diploma-app
+  K8S_NAMESPACE: default
+  K8S_DEPLOYMENT: diploma-app
+
+jobs:
+  build:
+    name: Build & Push image
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Compute image tag
+        id: meta
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+          else
+            TAG="sha-${GITHUB_SHA::7}"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "IMAGE_TAG=$TAG"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Yandex Container Registry
+        run: |
+          echo '${{ secrets.YC_SA_KEY_JSON }}' | docker login \
+            --username json_key \
+            --password-stdin ${{ env.REGISTRY }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          build-args: |
+            APP_VERSION=${{ steps.meta.outputs.tag }}
+            APP_BUILD=${{ github.sha }}
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.REGISTRY_ID }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.tag }}
+            ${{ env.REGISTRY }}/${{ env.REGISTRY_ID }}/${{ env.IMAGE_NAME }}:latest
+
+  deploy:
+    name: Deploy to Kubernetes
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install kubectl
+        run: |
+          KUBECTL_VERSION="$(curl -sSL https://dl.k8s.io/release/stable.txt)"
+          curl -sSLo kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+          chmod +x kubectl && sudo mv kubectl /usr/local/bin/kubectl
+          kubectl version --client
+
+      - name: Configure kubeconfig
+        run: |
+          mkdir -p ~/.kube
+          echo '${{ secrets.KUBE_CONFIG_B64 }}' | base64 -d > ~/.kube/config
+          chmod 600 ~/.kube/config
+          kubectl cluster-info
+
+      - name: Apply manifests
+        run: |
+          kubectl apply -f deploy/k8s/deployment.yaml
+          kubectl apply -f deploy/k8s/service.yaml
+          kubectl apply -f deploy/k8s/ingress.yaml
+
+      - name: Set new image
+        run: |
+          IMAGE="${REGISTRY}/${REGISTRY_ID}/${IMAGE_NAME}:${{ needs.build.outputs.tag }}"
+          echo "Deploying image: $IMAGE"
+          kubectl -n "${K8S_NAMESPACE}" set image \
+            "deployment/${K8S_DEPLOYMENT}" \
+            "diploma-app=${IMAGE}"
+
+      - name: Wait rollout
+        run: |
+          kubectl -n "${K8S_NAMESPACE}" rollout status \
+            "deployment/${K8S_DEPLOYMENT}" --timeout=180s
+          kubectl -n "${K8S_NAMESPACE}" get pods -l app.kubernetes.io/name=diploma-app -o wide

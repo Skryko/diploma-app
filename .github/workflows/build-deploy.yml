@@ -77,9 +77,7 @@ jobs:
           curl -sSLo kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
           chmod +x kubectl && sudo mv kubectl /usr/local/bin/kubectl
           kubectl version --client
-
-          curl -sSL https://storage.yandexcloud.net/yandexcloud-yc/install.sh | \
-            bash -s -- -i "$HOME/yandex-cloud" -n > /dev/null
+          curl -sSL https://storage.yandexcloud.net/yandexcloud-yc/install.sh | bash -s -- -i "$HOME/yandex-cloud" -n > /dev/null
           echo "$HOME/yandex-cloud/bin" >> "$GITHUB_PATH"
 
       - name: Authorize runner IP in YC SG
@@ -90,13 +88,9 @@ jobs:
         run: |
           echo '${{ secrets.YC_SA_KEY_JSON }}' > /tmp/sa-key.json
           chmod 600 /tmp/sa-key.json
-
           RUNNER_IP=$(curl -4 -sSL https://api.ipify.org)
           echo "runner_ip=$RUNNER_IP" >> "$GITHUB_OUTPUT"
-
-          yc vpc security-group update-rules ${{ env.YC_SG_ID }} \
-            --add-rule "direction=ingress,port=6443,protocol=tcp,v4-cidrs=$RUNNER_IP/32"
-          echo "Waiting for SG propagation..."
+          yc vpc security-group update-rules "${{ env.YC_SG_ID }}" --add-rule "direction=ingress,port=6443,protocol=tcp,v4-cidrs=$RUNNER_IP/32"
           sleep 20
 
       - name: Configure kubeconfig
@@ -115,15 +109,11 @@ jobs:
       - name: Set new image
         run: |
           IMAGE="${REGISTRY}/${REGISTRY_ID}/${IMAGE_NAME}:${{ needs.build.outputs.tag }}"
-          echo "Deploying image: $IMAGE"
-          kubectl -n "${K8S_NAMESPACE}" set image \
-            "deployment/${K8S_DEPLOYMENT}" \
-            "diploma-app=${IMAGE}"
+          kubectl -n "${K8S_NAMESPACE}" set image "deployment/${K8S_DEPLOYMENT}" "diploma-app=${IMAGE}"
 
       - name: Wait rollout
         run: |
-          kubectl -n "${K8S_NAMESPACE}" rollout status \
-            "deployment/${K8S_DEPLOYMENT}" --timeout=180s
+          kubectl -n "${K8S_NAMESPACE}" rollout status "deployment/${K8S_DEPLOYMENT}" --timeout=180s
           kubectl -n "${K8S_NAMESPACE}" get pods -l app.kubernetes.io/name=diploma-app -o wide
 
       - name: Cleanup SG rule
@@ -134,27 +124,7 @@ jobs:
         run: |
           echo '${{ secrets.YC_SA_KEY_JSON }}' > /tmp/sa-key.json
           chmod 600 /tmp/sa-key.json
-
           RUNNER_IP="${{ steps.authorize.outputs.runner_ip }}"
-          if [ -z "$RUNNER_IP" ]; then
-            echo "No runner IP to clean up"
-            exit 0
-          fi
-
-          RULE_ID=$(yc vpc security-group get ${{ env.YC_SG_ID }} --format json | \
-            python3 -c "
-import sys, json
-data = json.load(sys.stdin)
-for r in data.get('rules', []):
-    if (r.get('direction') == 'INGRESS'
-        and r.get('ports', {}).get('from_port') == '6443'
-        and r.get('cidr_blocks', {}).get('v4_cidr_blocks') == ['${RUNNER_IP}/32']):
-        print(r['id'])
-        break
-")
-          if [ -n "$RULE_ID" ]; then
-            echo "Deleting SG rule $RULE_ID for $RUNNER_IP"
-            yc vpc security-group update-rules ${{ env.YC_SG_ID }} --delete-rule-id "$RULE_ID"
-          else
-            echo "No matching rule found for $RUNNER_IP"
-          fi
+          if [ -z "$RUNNER_IP" ]; then exit 0; fi
+          RULE_ID=$(yc vpc security-group get "${{ env.YC_SG_ID }}" --format json | jq -r --arg ip "$RUNNER_IP/32" '[.rules[] | select(.direction=="INGRESS" and .ports.from_port==6443 and ((.cidr_blocks.v4_cidr_blocks // []) | index($ip)))] | first | .id // empty')
+          if [ -n "$RULE_ID" ]; then yc vpc security-group update-rules "${{ env.YC_SG_ID }}" --delete-rule-id "$RULE_ID"; fi

@@ -12,6 +12,7 @@ env:
   IMAGE_NAME: diploma-app
   K8S_NAMESPACE: default
   K8S_DEPLOYMENT: diploma-app
+  YC_SG_ID: enpc51tssafdu7pisaf7
 
 jobs:
   build:
@@ -64,16 +65,41 @@ jobs:
     needs: build
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
+    env:
+      YC_SERVICE_ACCOUNT_KEY_FILE: /tmp/sa-key.json
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install kubectl
+      - name: Install kubectl and yc
         run: |
           KUBECTL_VERSION="$(curl -sSL https://dl.k8s.io/release/stable.txt)"
           curl -sSLo kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
           chmod +x kubectl && sudo mv kubectl /usr/local/bin/kubectl
           kubectl version --client
+
+          curl -sSL https://storage.yandexcloud.net/yandexcloud-yc/install.sh | \
+            bash -s -- -i "$HOME/yandex-cloud" -n > /dev/null
+          echo "$HOME/yandex-cloud/bin" >> "$GITHUB_PATH"
+
+      - name: Authorize runner IP in YC SG
+        id: authorize
+        env:
+          YC_CLOUD_ID: ${{ secrets.YC_CLOUD_ID }}
+          YC_FOLDER_ID: ${{ secrets.YC_FOLDER_ID }}
+        run: |
+          echo '${{ secrets.YC_SA_KEY_JSON }}' > /tmp/sa-key.json
+          chmod 600 /tmp/sa-key.json
+
+          RUNNER_IP=$(curl -4 -sSL https://api.ipify.org)
+          echo "runner_ip=$RUNNER_IP" >> "$GITHUB_OUTPUT"
+
+          RULE="direction=ingress,port=6443,protocol=tcp,v4-cidr-blocks=$RUNNER_IP/32"
+          echo "rule=$RULE" >> "$GITHUB_OUTPUT"
+
+          yc vpc security-group update-rules ${{ env.YC_SG_ID }} --add-rule "$RULE"
+          echo "Waiting for SG propagation..."
+          sleep 20
 
       - name: Configure kubeconfig
         run: |
@@ -101,3 +127,14 @@ jobs:
           kubectl -n "${K8S_NAMESPACE}" rollout status \
             "deployment/${K8S_DEPLOYMENT}" --timeout=180s
           kubectl -n "${K8S_NAMESPACE}" get pods -l app.kubernetes.io/name=diploma-app -o wide
+
+      - name: Cleanup SG rule
+        if: always()
+        env:
+          YC_CLOUD_ID: ${{ secrets.YC_CLOUD_ID }}
+          YC_FOLDER_ID: ${{ secrets.YC_FOLDER_ID }}
+        run: |
+          echo '${{ secrets.YC_SA_KEY_JSON }}' > /tmp/sa-key.json
+          chmod 600 /tmp/sa-key.json
+          yc vpc security-group update-rules ${{ env.YC_SG_ID }} \
+            --delete-rule "${{ steps.authorize.outputs.rule }}" || true

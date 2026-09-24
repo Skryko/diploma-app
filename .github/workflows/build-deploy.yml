@@ -94,10 +94,8 @@ jobs:
           RUNNER_IP=$(curl -4 -sSL https://api.ipify.org)
           echo "runner_ip=$RUNNER_IP" >> "$GITHUB_OUTPUT"
 
-          RULE="direction=ingress,port=6443,protocol=tcp,v4-cidr-blocks=$RUNNER_IP/32"
-          echo "rule=$RULE" >> "$GITHUB_OUTPUT"
-
-          yc vpc security-group update-rules ${{ env.YC_SG_ID }} --add-rule "$RULE"
+          yc vpc security-group update-rules ${{ env.YC_SG_ID }} \
+            --add-rule "direction=ingress,port=6443,protocol=tcp,v4-cidrs=$RUNNER_IP/32"
           echo "Waiting for SG propagation..."
           sleep 20
 
@@ -136,5 +134,27 @@ jobs:
         run: |
           echo '${{ secrets.YC_SA_KEY_JSON }}' > /tmp/sa-key.json
           chmod 600 /tmp/sa-key.json
-          yc vpc security-group update-rules ${{ env.YC_SG_ID }} \
-            --delete-rule "${{ steps.authorize.outputs.rule }}" || true
+
+          RUNNER_IP="${{ steps.authorize.outputs.runner_ip }}"
+          if [ -z "$RUNNER_IP" ]; then
+            echo "No runner IP to clean up"
+            exit 0
+          fi
+
+          RULE_ID=$(yc vpc security-group get ${{ env.YC_SG_ID }} --format json | \
+            python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+for r in data.get('rules', []):
+    if (r.get('direction') == 'INGRESS'
+        and r.get('ports', {}).get('from_port') == '6443'
+        and r.get('cidr_blocks', {}).get('v4_cidr_blocks') == ['${RUNNER_IP}/32']):
+        print(r['id'])
+        break
+")
+          if [ -n "$RULE_ID" ]; then
+            echo "Deleting SG rule $RULE_ID for $RUNNER_IP"
+            yc vpc security-group update-rules ${{ env.YC_SG_ID }} --delete-rule-id "$RULE_ID"
+          else
+            echo "No matching rule found for $RUNNER_IP"
+          fi
